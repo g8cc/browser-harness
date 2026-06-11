@@ -103,6 +103,68 @@ PY
 - Auth wall: redirected to login → stop and ask the user. Don't type credentials from screenshots.
 - Raw CDP for anything helpers don't cover: cdp("Domain.method", params).
 
+## Best Practices
+
+### 1. Search Priority: URL Construction
+
+优先使用 URL 构造搜索，避免交互失败：
+
+```bash
+browser-harness <<'PY'
+import sys
+sys.path.insert(0, 'agent-workspace')
+from agent_helpers import search_site
+
+# 自动构造搜索 URL（B 站默认按最新发布排序）
+search_url = search_site("bilibili.com", "课代表立正")
+new_tab(search_url)
+PY
+```
+
+### 2. Task Manager: Tab Lifecycle
+
+使用任务管理器管理标签页生命周期：
+
+```bash
+browser-harness <<'PY'
+import sys
+sys.path.insert(0, 'agent-workspace')
+from agent_helpers import browser_task
+
+with browser_task("bilibili_search") as task:
+    task.new_tab("https://search.bilibili.com/all?keyword=xxx&order=pubdate")
+    task.new_tab("https://www.bilibili.com/video/BVxxx")
+    task.close_all_except(1)  # 只保留视频标签页
+PY
+```
+
+### 3. Video Playback Control
+
+控制视频播放（跳转到指定时间）：
+
+```bash
+browser-harness <<'PY'
+# 跳转到 12 分钟并播放
+js("""
+    const video = document.querySelector('video');
+    video.currentTime = 720;  // 12分钟 = 720秒
+    video.play();
+""")
+PY
+```
+
+### 4. Bilibili Search with Sort
+
+B 站搜索按最新发布排序：
+
+```bash
+browser-harness <<'PY'
+# 使用 URL 参数 order=pubdate 按发布时间排序
+new_tab("https://search.bilibili.com/all?keyword=课代表立正&order=pubdate")
+wait_for_load()
+PY
+```
+
 ## Design constraints
 
 - Coordinate clicks default. Input.dispatchMouseEvent goes through iframes/shadow/cross-origin at the compositor level.
