@@ -1,18 +1,19 @@
 #!/bin/bash
 # Cookies 管理 CLI
-# 用法: ./cookies-cli.sh [check|sync|status]
+# 用法: ./cookies-cli.sh [check|sync|status|health]
 
 set -e
 
 ACTION=${1:-"check"}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
 case $ACTION in
     "check")
         echo "检查 cookies 状态..."
         browser-harness <<'PY'
 import sys
-sys.path.insert(0, '/Users/wardonguo/Documents/work/code/AI/AIworkspace/browser-harness/agent-workspace')
+sys.path.insert(0, 'agent-workspace')
 from agent_helpers import check_cookies_expired, remind_sync_cookies
 
 expired, site = check_cookies_expired()
@@ -31,7 +32,7 @@ PY
         echo "同步 cookies..."
         browser-harness <<'PY'
 import sys
-sys.path.insert(0, '/Users/wardonguo/Documents/work/code/AI/AIworkspace/browser-harness/agent-workspace')
+sys.path.insert(0, 'agent-workspace')
 from agent_helpers import get_cookies_from_main_browser, sync_cookies_to_ai_browser
 
 # 先检查状态
@@ -59,7 +60,7 @@ PY
         echo "获取 cookies 状态..."
         browser-harness <<'PY'
 import sys
-sys.path.insert(0, '/Users/wardonguo/Documents/work/code/AI/AIworkspace/browser-harness/agent-workspace')
+sys.path.insert(0, 'agent-workspace')
 from agent_helpers import check_cookies_expired
 
 expired, site = check_cookies_expired()
@@ -68,6 +69,27 @@ if expired:
     print(f"SITE={site}")
 else:
     print("STATUS=valid")
+PY
+        ;;
+    
+    "health")
+        echo "检查 daemon 健康状态..."
+        browser-harness <<'PY'
+import sys
+sys.path.insert(0, 'agent-workspace')
+from agent_helpers import check_daemon_health, safe_page_info
+
+if check_daemon_health():
+    page = safe_page_info()
+    if page:
+        print("HEALTH=ok")
+        print(f"URL={page.get('url')}")
+    else:
+        print("HEALTH=warning")
+        print("MESSAGE=无法获取页面信息")
+else:
+    print("HEALTH=error")
+    print("MESSAGE=daemon 不健康")
 PY
         ;;
     
@@ -80,12 +102,14 @@ PY
         echo "  check   检查 cookies 是否过期"
         echo "  sync    同步 cookies 到 AI 浏览器"
         echo "  status  获取状态（机器可读）"
+        echo "  health  检查 daemon 健康状态"
         echo "  help    显示帮助"
         echo ""
         echo "示例:"
         echo "  $0 check   # 检查是否需要登录"
         echo "  $0 sync    # 同步 cookies"
         echo "  $0 status  # 获取状态"
+        echo "  $0 health  # 检查 daemon 健康"
         ;;
     
     *)
