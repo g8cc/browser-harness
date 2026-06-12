@@ -490,3 +490,256 @@ def bilibili_open_latest_video(keyword):
     
     return page
 
+
+# ============================================================
+# 图片识别大模型集成
+# ============================================================
+
+# 图片识别模型配置
+VISION_MODELS = {
+    "openai": {
+        "name": "OpenAI GPT-4V",
+        "api_url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4-vision-preview",
+        "env_key": "OPENAI_API_KEY"
+    },
+    "claude": {
+        "name": "Claude 3.5 Sonnet",
+        "api_url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-3-5-sonnet-20241022",
+        "env_key": "ANTHROPIC_API_KEY"
+    },
+    "gemini": {
+        "name": "Google Gemini Pro Vision",
+        "api_url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent",
+        "model": "gemini-pro-vision",
+        "env_key": "GOOGLE_API_KEY"
+    },
+    "qwen": {
+        "name": "通义千问 VL",
+        "api_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+        "model": "qwen-vl-plus",
+        "env_key": "DASHSCOPE_API_KEY"
+    }
+}
+
+# 默认使用的模型
+DEFAULT_VISION_MODEL = "openai"
+
+
+def get_vision_model(model_name=None):
+    """获取图片识别模型配置"""
+    model_name = model_name or DEFAULT_VISION_MODEL
+    return VISION_MODELS.get(model_name)
+
+
+def analyze_screenshot(image_path, prompt="描述这个页面的内容", model_name=None):
+    """分析截图
+    
+    Args:
+        image_path: 截图文件路径
+        prompt: 分析提示词
+        model_name: 使用的模型名称（openai, claude, gemini, qwen）
+    
+    Returns:
+        分析结果文本
+    """
+    import base64
+    
+    model = get_vision_model(model_name)
+    if not model:
+        return "❌ 未知的模型: " + str(model_name)
+    
+    api_key = os.environ.get(model["env_key"])
+    if not api_key:
+        return "❌ 未设置环境变量: " + model["env_key"]
+    
+    # 读取图片
+    with open(image_path, "rb") as f:
+        image_data = base64.b64encode(f.read()).decode("utf-8")
+    
+    # 根据模型类型调用 API
+    if model_name == "openai":
+        return _call_openai_vision(api_key, model, image_data, prompt)
+    elif model_name == "claude":
+        return _call_claude_vision(api_key, model, image_data, prompt)
+    elif model_name == "gemini":
+        return _call_gemini_vision(api_key, model, image_data, prompt)
+    elif model_name == "qwen":
+        return _call_qwen_vision(api_key, model, image_data, prompt)
+    else:
+        return "❌ 不支持的模型: " + str(model_name)
+
+
+def _call_openai_vision(api_key, model, image_data, prompt):
+    """调用 OpenAI GPT-4V"""
+    import httpx
+    
+    response = httpx.post(
+        model["api_url"],
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": model["model"],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64," + image_data
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1000
+        },
+        timeout=30
+    )
+    
+    if response.status_code == 200:
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+    else:
+        return "❌ API 调用失败: " + str(response.status_code)
+
+
+def _call_claude_vision(api_key, model, image_data, prompt):
+    """调用 Claude 3.5 Sonnet"""
+    import httpx
+    
+    response = httpx.post(
+        model["api_url"],
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": model["model"],
+            "max_tokens": 1000,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": image_data
+                            }
+                        },
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+        },
+        timeout=30
+    )
+    
+    if response.status_code == 200:
+        result = response.json()
+        return result["content"][0]["text"]
+    else:
+        return "❌ API 调用失败: " + str(response.status_code)
+
+
+def _call_gemini_vision(api_key, model, image_data, prompt):
+    """调用 Google Gemini Pro Vision"""
+    import httpx
+    
+    response = httpx.post(
+        model["api_url"] + "?key=" + api_key,
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": image_data
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        timeout=30
+    )
+    
+    if response.status_code == 200:
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    else:
+        return "❌ API 调用失败: " + str(response.status_code)
+
+
+def _call_qwen_vision(api_key, model, image_data, prompt):
+    """调用通义千问 VL"""
+    import httpx
+    
+    response = httpx.post(
+        model["api_url"],
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": model["model"],
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"image": "data:image/png;base64," + image_data},
+                            {"text": prompt}
+                        ]
+                    }
+                ]
+            }
+        },
+        timeout=30
+    )
+    
+    if response.status_code == 200:
+        result = response.json()
+        return result["output"]["choices"][0]["message"]["content"]
+    else:
+        return "❌ API 调用失败: " + str(response.status_code)
+
+
+def screenshot_and_analyze(prompt="描述这个页面的内容", model_name=None):
+    """截图并分析
+    
+    Args:
+        prompt: 分析提示词
+        model_name: 使用的模型名称
+    
+    Returns:
+        分析结果文本
+    """
+    from browser_harness.helpers import capture_screenshot
+    
+    # 截图
+    image_path = capture_screenshot()
+    
+    # 分析
+    return analyze_screenshot(image_path, prompt, model_name)
+
+
+def list_vision_models():
+    """列出所有可用的图片识别模型"""
+    print("可用的图片识别模型:")
+    for name, model in VISION_MODELS.items():
+        api_key = os.environ.get(model["env_key"])
+        status = "✅ 已配置" if api_key else "❌ 未配置"
+        print("  " + name + ": " + model["name"] + " (" + status + ")")
+
