@@ -165,46 +165,7 @@ wait_for_load()
 PY
 ```
 
-### 5. Bilibili Search Results Extraction
-
-提取 B 站搜索结果（过滤掉播放量/时长信息）：
-
-```bash
-browser-harness <<'PY'
-import sys
-sys.path.insert(0, 'agent-workspace')
-from agent_helpers import bilibili_extract_search_results
-
-# 提取搜索结果
-results = bilibili_extract_search_results(10)
-if results:
-    for i, video in enumerate(results[:5]):
-        print(str(i+1) + ". " + video.get("text"))
-        print("   href: " + video.get("href"))
-PY
-```
-
-**关键点**
-- 播放量/时长信息包含换行符（如 "690\n2\n37:28"）
-- 视频标题不包含换行符
-- 使用 `!a.innerText.includes('\n')` 过滤
-
-### 6. Bilibili Open Latest Video
-
-打开 B 站最新视频：
-
-```bash
-browser-harness <<'PY'
-import sys
-sys.path.insert(0, 'agent-workspace')
-from agent_helpers import bilibili_open_latest_video
-
-# 打开最新视频
-page = bilibili_open_latest_video("课代表立正")
-if page:
-    print("视频标题: " + page.get("title"))
-PY
-```
+**Reference**: [agent-workspace/domain-skills/bilibili/search.md](../../../agent-workspace/domain-skills/bilibili/search.md) for complete Bilibili search guide.
 
 ## Design constraints
 
