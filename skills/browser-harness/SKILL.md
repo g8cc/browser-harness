@@ -167,6 +167,16 @@ PY
 
 **Reference**: [agent-workspace/domain-skills/bilibili/search.md](../../../agent-workspace/domain-skills/bilibili/search.md) for complete Bilibili search guide.
 
+### 5. Common Website Search
+
+常用网站搜索最佳实践：
+
+| 网站 | 搜索 URL | Reference |
+|------|----------|-----------|
+| 知乎 | `https://www.zhihu.com/search?type=content&q={QUERY}` | [zhihu/search.md](../../../agent-workspace/domain-skills/zhihu/search.md) |
+| 百度 | `https://www.baidu.com/s?wd={QUERY}` | [baidu/search.md](../../../agent-workspace/domain-skills/baidu/search.md) |
+| GitHub | `https://github.com/search?q={QUERY}&type=repositories` | [github/search.md](../../../agent-workspace/domain-skills/github/search.md) |
+
 ## Design constraints
 
 - Coordinate clicks default. Input.dispatchMouseEvent goes through iframes/shadow/cross-origin at the compositor level.
