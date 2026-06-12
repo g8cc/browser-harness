@@ -429,3 +429,64 @@ def bilibili_get_video_info(bvid):
     
     return None
 
+
+def bilibili_extract_search_results(count=10):
+    """提取 B 站搜索结果（优化版）
+    
+    过滤掉播放量/时长信息，只保留视频标题
+    """
+    from browser_harness.helpers import js
+    
+    return js("""
+        Array.from(document.querySelectorAll('a[href*="/video/BV"]'))
+            .filter(a => !a.innerText.includes('\\n'))  // 过滤掉播放量/时长
+            .filter(a => a.innerText.trim().length > 10)  // 过滤掉太短的文本
+            .slice(0, """ + str(count) + """)
+            .map(a => ({
+                href: a.href,
+                text: a.innerText.trim()
+            }))
+    """)
+
+
+def bilibili_open_latest_video(keyword):
+    """打开 B 站最新视频
+    
+    1. 搜索关键词（按最新发布排序）
+    2. 提取搜索结果
+    3. 打开第一个视频
+    """
+    from browser_harness.helpers import new_tab, wait_for_load, page_info
+    
+    # 搜索 URL（按最新发布排序）
+    import urllib.parse
+    encoded_keyword = urllib.parse.quote(keyword)
+    search_url = f"https://search.bilibili.com/all?keyword={encoded_keyword}&order=pubdate"
+    
+    # 打开搜索页
+    new_tab(search_url)
+    wait_for_load()
+    
+    # 提取搜索结果
+    results = bilibili_extract_search_results(5)
+    
+    if not results:
+        print("❌ 未找到搜索结果")
+        return None
+    
+    # 获取第一个视频
+    first_video = results[0]
+    video_url = first_video.get("href", "")
+    
+    if not video_url.startswith("http"):
+        video_url = "https:" + video_url
+    
+    # 打开视频
+    new_tab(video_url)
+    wait_for_load()
+    
+    page = page_info()
+    print("✅ 已打开最新视频: " + page.get("title", ""))
+    
+    return page
+
