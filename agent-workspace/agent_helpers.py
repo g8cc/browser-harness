@@ -7,6 +7,9 @@ repo's default agent-workspace exists.
 
 import json
 import os
+import secrets
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -742,4 +745,603 @@ def list_vision_models():
         api_key = os.environ.get(model["env_key"])
         status = "✅ 已配置" if api_key else "❌ 未配置"
         print("  " + name + ": " + model["name"] + " (" + status + ")")
+
+
+# ============================================================
+# 飞书 Human-in-the-Loop Bridge
+# ============================================================
+
+FEISHU_USER_ID = os.environ.get("FEISHU_USER_ID", "ou_e16af12bff09416d92a9ac0bc4d98966")
+FEISHU_RESPONSE_DIR = "/tmp/bh-feishu-responses"
+FEISHU_LOG_FILE = "/tmp/bh-feishu-responses/.subscriber.log"
+BH_LARK_PROFILE = os.environ.get("BH_LARK_PROFILE", "qs")
+_feishu_subscriber = None
+
+
+def _lc(*args):
+    """Build a lark-cli argv, injecting --profile after the binary when BH_LARK_PROFILE is set."""
+    if BH_LARK_PROFILE:
+        return ["lark-cli", "--profile", BH_LARK_PROFILE, *args]
+    return ["lark-cli", *args]
+
+
+def _lc_pgrep_pattern():
+    """Regex matching lark-cli event +subscribe with optional --profile flag."""
+    if BH_LARK_PROFILE:
+        return r"lark-cli --profile %s event \+subscribe" % BH_LARK_PROFILE
+    return r"lark-cli( --profile \S+)? event \+subscribe"
+
+
+def _log(msg):
+    print(msg, flush=True)
+
+
+class _AdoptedProcess:
+    """包装已有运行的进程 PID，提供 poll() 和 terminate() 接口"""
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except OSError:
+            return 1
+
+    def terminate(self):
+        try:
+            os.kill(self.pid, 15)
+        except OSError:
+            pass
+
+    def kill(self):
+        try:
+            os.kill(self.pid, 9)
+        except OSError:
+            pass
+
+    def wait(self, timeout=None):
+        pass
+
+
+def _kill_all_subscribers():
+    """Kill ALL lark-cli event +subscribe processes to ensure exclusive access."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "lark-cli event \\+subscribe"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                try:
+                    pid = int(line.strip())
+                    os.kill(pid, 9)
+                except (ValueError, OSError):
+                    pass
+            time.sleep(0.5)
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
+
+
+def _find_existing_subscriber():
+    """查找已于当前 profile 下运行的 lark-cli event subscriber 进程"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", _lc_pgrep_pattern()],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().splitlines()
+            if pids:
+                return int(pids[0])
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
+def feishu_start():
+    """启动飞书事件监听后台进程，等待 WebSocket 连接就绪"""
+    global _feishu_subscriber
+
+    if _feishu_subscriber and _feishu_subscriber.poll() is None:
+        return _feishu_subscriber
+
+    existing_pid = _find_existing_subscriber()
+    if existing_pid is not None:
+        _feishu_subscriber = _AdoptedProcess(existing_pid)
+        _log("已接管飞书事件监听 (PID: %d)" % existing_pid)
+        return _feishu_subscriber
+
+    _kill_all_subscribers()
+
+    for lock_file in Path.home().glob(".lark-cli/locks/subscribe_*.lock"):
+        try:
+            lock_file.unlink()
+        except OSError:
+            pass
+
+    os.makedirs(FEISHU_RESPONSE_DIR, mode=0o700, exist_ok=True)
+
+    for entry in os.scandir(FEISHU_RESPONSE_DIR):
+        if entry.is_file() and entry.name.endswith(".json"):
+            try:
+                os.unlink(entry.path)
+            except OSError:
+                pass
+
+    log_fh = open(FEISHU_LOG_FILE, "w")
+    _feishu_subscriber = subprocess.Popen(
+        _lc("event", "+subscribe",
+            "--as", "bot",
+            "--force",
+            "--compact",
+            "--event-types", "im.message.receive_v1,card.action.trigger",
+            "--output-dir", "."),
+        cwd=FEISHU_RESPONSE_DIR,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+    )
+
+    # 等待 WebSocket 连接就绪（从日志中检测 "Connected"）
+    for _ in range(20):
+        time.sleep(0.5)
+        if _feishu_subscriber.poll() is not None:
+            log_fh.close()
+            raise RuntimeError("飞书事件监听启动失败，请检查应用权限和卡片回调配置")
+        try:
+            with open(FEISHU_LOG_FILE) as f:
+                if "Connected" in f.read():
+                    break
+        except IOError:
+            pass
+    else:
+        _feishu_subscriber.terminate()
+        log_fh.close()
+        raise RuntimeError("飞书事件监听连接超时 (10s)")
+
+    log_fh.close()
+    _log("飞书事件监听已启动 (PID: %d)" % _feishu_subscriber.pid)
+    return _feishu_subscriber
+
+
+def _ensure_subscriber():
+    """确保事件监听进程存活，死亡则自动重启"""
+    global _feishu_subscriber
+    if _feishu_subscriber is not None and _feishu_subscriber.poll() is None:
+        return
+    feishu_start()
+
+
+def feishu_stop():
+    """停止飞书事件监听"""
+    global _feishu_subscriber
+    if _feishu_subscriber and _feishu_subscriber.poll() is None:
+        _feishu_subscriber.terminate()
+        try:
+            _feishu_subscriber.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _feishu_subscriber.kill()
+        _log("飞书事件监听已停止")
+    _feishu_subscriber = None
+
+
+def _send_feishu_card(card_json, user_id=None, urgent=True):
+    """通过 lark-cli 发送互动卡片，返回 (message_id, chat_id)。urgent=True 时附带应用内加急。"""
+    user_id = user_id or FEISHU_USER_ID
+    result = subprocess.run(
+        _lc("im", "+messages-send",
+            "--as", "bot",
+            "--user-id", user_id,
+            "--msg-type", "interactive",
+            "--content", card_json),
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        err = result.stdout.strip() or result.stderr.strip()
+        raise RuntimeError("发送飞书卡片失败: " + err)
+    data = json.loads(result.stdout)
+    if not data.get("ok"):
+        raise RuntimeError("发送飞书卡片失败: " + str(data.get("error", {})))
+    msg_data = data.get("data", {})
+    message_id = msg_data["message_id"]
+    chat_id = msg_data.get("chat_id", "")
+
+    if urgent and message_id:
+        subprocess.run(
+            _lc("im", "messages", "urgent_app", "--as", "bot",
+                "--params", json.dumps({"message_id": message_id, "user_id_type": "open_id"}),
+                "--data", json.dumps({"user_id_list": [user_id]})),
+            capture_output=True, text=True, timeout=10,
+        )
+
+    return message_id, chat_id
+
+
+def _update_feishu_card(message_id, status_text="✅ 已处理", template="green"):
+    """更新已发送的卡片为终态（移除按钮，显示处理结果）"""
+    card_json = json.dumps({
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": status_text}, "template": template},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": status_text}},
+        ],
+    }, ensure_ascii=False)
+    data = json.dumps({"content": card_json})
+    result = subprocess.run(
+        _lc("api", "PATCH", "/open-apis/im/v1/messages/" + message_id,
+            "--as", "bot", "--data", data),
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode == 0:
+        try:
+            resp = json.loads(result.stdout)
+            if resp.get("ok") or resp.get("code") == 0:
+                return True
+        except json.JSONDecodeError:
+            pass
+    return False
+
+
+def _safe_read_json(filepath):
+    """安全读取 JSON 文件，处理部分写入和损坏文件"""
+    try:
+        with open(filepath) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError, ValueError):
+        return None
+
+
+def _safe_remove(filepath):
+    try:
+        os.unlink(filepath)
+    except OSError:
+        pass
+
+
+def _poll_feishu_response(request_id, timeout=300, chat_id=None, sent_time_ms=None):
+    """轮询等待匹配的回调：先查 WebSocket 文件，再用 API 轮询文本消息作为降级。"""
+    deadline = time.time() + timeout
+    start_time = time.time()
+    poll_interval = 0.3
+    api_poll_interval = 5.0
+    last_api_poll = 0
+
+    while time.time() < deadline:
+        _ensure_subscriber()
+
+        try:
+            entries = list(os.scandir(FEISHU_RESPONSE_DIR))
+        except OSError:
+            entries = []
+
+        for entry in entries:
+            if not entry.is_file() or not entry.name.endswith(".json"):
+                continue
+
+            if entry.name.startswith("card.action.trigger_"):
+                data = _safe_read_json(entry.path)
+                if data is None:
+                    continue
+                value = data.get("action", {}).get("value", {})
+                if isinstance(value, dict) and value.get("request_id") == request_id:
+                    _safe_remove(entry.path)
+                    return data
+
+            elif entry.name.startswith("im.message.receive_v1_"):
+                data = _safe_read_json(entry.path)
+                if data is None:
+                    continue
+                try:
+                    msg_content = json.loads(data.get("message", {}).get("content", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                text = msg_content.get("text", "")
+                if text.startswith(request_id + ":"):
+                    _safe_remove(entry.path)
+                    return {"action": {"value": {"action": "text_reply", "text": text.split(":", 1)[1]}}}
+
+        if chat_id and time.time() - last_api_poll > api_poll_interval:
+            last_api_poll = time.time()
+            reply = _api_poll_text_reply(chat_id, sent_time_ms or 0, request_id)
+            if reply is not None:
+                return reply
+
+        time.sleep(poll_interval)
+        if time.time() - start_time > 30:
+            poll_interval = 2.0
+
+    return None
+
+
+def _api_poll_text_reply(chat_id, since_time_ms, request_id):
+    """通过 lark-cli API 轮询聊天中的文本回复，作为 WebSocket 降级。"""
+    result = subprocess.run(
+        _lc("im", "+chat-messages-list",
+            "--as", "bot", "--chat-id", chat_id,
+            "--page-size", "5", "--sort", "desc"),
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        resp = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    messages = resp.get("data", {}).get("messages", [])
+    since_sec = since_time_ms // 1000 if since_time_ms > 1e12 else since_time_ms
+    for msg in messages:
+        if msg.get("msg_type") != "text":
+            continue
+        sender = msg.get("sender", {})
+        if sender.get("sender_type") != "user":
+            continue
+        create_str = msg.get("create_time", "")
+        if create_str:
+            try:
+                from datetime import datetime
+                msg_dt = datetime.strptime(create_str, "%Y-%m-%d %H:%M")
+                msg_epoch = int(msg_dt.timestamp())
+                if msg_epoch < since_sec - 60:
+                    continue
+            except (ValueError, OSError):
+                pass
+        text = msg.get("content", "").strip()
+        if text:
+            return {"action": {"value": {"action": "text_reply", "text": text}}}
+    return None
+
+
+def _build_confirm_card(title, description, request_id):
+    return json.dumps({
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "🤖 " + title}, "template": "orange"},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": description}},
+            {"tag": "action", "actions": [
+                {"tag": "button", "text": {"tag": "plain_text", "content": "✅ 确认"},
+                 "type": "primary", "value": {"action": "confirm", "request_id": request_id}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "❌ 取消"},
+                 "type": "danger", "value": {"action": "cancel", "request_id": request_id}},
+            ]},
+        ],
+    }, ensure_ascii=False)
+
+
+def _build_input_card(title, description, input_label, request_id):
+    return json.dumps({
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "🤖 " + title}, "template": "orange"},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": description}},
+            {"tag": "action", "actions": [
+                {"tag": "input", "name": "user_input",
+                 "placeholder": {"tag": "plain_text", "content": input_label}},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "提交"},
+                 "type": "primary", "value": {"action": "submit_input", "request_id": request_id}},
+            ]},
+        ],
+    }, ensure_ascii=False)
+
+
+def _build_select_card(title, description, options, request_id):
+    option_elements = [
+        {"label": opt["label"], "value": opt.get("value", opt["label"])} for opt in options
+    ]
+    return json.dumps({
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "🤖 " + title}, "template": "orange"},
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": description}},
+            {"tag": "action", "actions": [
+                {"tag": "select_static", "name": "user_select",
+                 "placeholder": {"tag": "plain_text", "content": "请选择"},
+                 "options": option_elements},
+                {"tag": "button", "text": {"tag": "plain_text", "content": "提交"},
+                 "type": "primary", "value": {"action": "submit_select", "request_id": request_id}},
+            ]},
+        ],
+    }, ensure_ascii=False)
+
+
+def ask_human(title, description, card_type="confirm", input_label="", options=None,
+              timeout=300, user_id=None):
+    """向用户发送飞书互动卡片，等待人类响应。
+
+    Args:
+        title:       卡片标题
+        description: 卡片正文 (支持飞书 Markdown)
+        card_type:   "confirm" | "input" | "select"
+        input_label: input 类型的输入框占位文字
+        options:     select 类型的选项列表 [{"label": "...", "value": "..."}, ...]
+        timeout:     等待超时秒数 (默认 5 分钟)
+        user_id:     飞书用户 open_id (默认使用 FEISHU_USER_ID)
+
+    Returns:
+        dict: {action, value, raw}
+        - action: "confirm" | "cancel" | "submit_input" | "submit_select" | "text_reply" | None (超时)
+        - value:  用户输入/选择的值
+        - raw:    原始回调数据
+    """
+    _ensure_subscriber()
+
+    request_id = secrets.token_hex(6)
+    builders = {
+        "confirm": lambda: _build_confirm_card(title, description, request_id),
+        "input": lambda: _build_input_card(title, description, input_label, request_id),
+        "select": lambda: _build_select_card(title, description, options or [], request_id),
+    }
+    builder = builders.get(card_type)
+    if not builder:
+        raise ValueError("不支持的 card_type: " + card_type)
+
+    sent_time_ms = int(time.time() * 1000)
+    message_id, chat_id = _send_feishu_card(builder(), user_id)
+    _log("飞书卡片已发送 (%s), 等待响应..." % message_id)
+
+    callback = _poll_feishu_response(request_id, timeout=timeout,
+                                   chat_id=chat_id, sent_time_ms=sent_time_ms)
+    if callback is None:
+        _log("飞书响应超时 (%ds)" % timeout)
+        _update_feishu_card(message_id, "⏰ 等待超时 (%ds)" % timeout, "grey")
+        return {"action": None, "value": None, "raw": None}
+
+    action_value = callback.get("action", {}).get("value", {})
+    action = action_value.get("action") if isinstance(action_value, dict) else None
+    inputs = callback.get("action", {}).get("inputs", {})
+
+    value = None
+    if action == "submit_input":
+        value = inputs.get("user_input", "")
+    elif action == "submit_select":
+        value = inputs.get("user_select", "")
+    elif action == "text_reply":
+        value = action_value.get("text", "")
+
+    if action in ("submit_input", "submit_select") and not value and chat_id:
+        _log("卡片回调无 inputs，等待文字回复作为降级...")
+        text_cb = _poll_feishu_response(request_id, timeout=30,
+                                      chat_id=chat_id, sent_time_ms=sent_time_ms)
+        if text_cb:
+            tv = text_cb.get("action", {}).get("value", {})
+            if tv.get("action") == "text_reply":
+                value = tv.get("text", "")
+                action = "text_reply"
+
+    _log("收到飞书响应: action=%s, value=%s" % (action, value))
+
+    status_map = {
+        "confirm": ("✅ 已确认", "green"),
+        "cancel": ("❌ 已取消", "red"),
+    }
+    if action in status_map:
+        status_text, template = status_map[action]
+    elif action == "text_reply":
+        status_text, template = "💬 回复: %s" % (value or ""), "blue"
+    elif action in ("submit_input", "submit_select"):
+        status_text = "✅ 已提交: %s" % (value or "(空)")
+        template = "green"
+    else:
+        status_text, template = "已响应", "green"
+
+    _update_feishu_card(message_id, status_text, template)
+
+    return {"action": action, "value": value, "raw": callback}
+
+
+# ============================================================
+# Sidecar 直填模式（敏感数据零泄漏）
+# ============================================================
+
+_SIDECAR_DIR = "/tmp/bh-feishu-sidecar"
+_SIDECAR_PID_FILE = os.path.join(_SIDECAR_DIR, "sidecar.pid")
+_sidecar_process = None
+
+
+def _sidecar_alive():
+    if _sidecar_process is None or _sidecar_process.poll() is not None:
+        return False
+    return True
+
+
+def sidecar_start():
+    """启动 Sidecar 守护进程（敏感数据直填浏览器）"""
+    global _sidecar_process
+
+    if _sidecar_alive():
+        return _sidecar_process
+
+    for d in (_SIDECAR_DIR,
+              os.path.join(_SIDECAR_DIR, "registry"),
+              os.path.join(_SIDECAR_DIR, "status")):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+
+    sidecar_script = os.path.join(os.path.dirname(__file__), "feishu_sidecar.py")
+    _sidecar_process = subprocess.Popen(
+        [sys.executable, sidecar_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)
+    _log("Sidecar 守护进程已启动 (PID: %d)" % _sidecar_process.pid)
+    return _sidecar_process
+
+
+def sidecar_stop():
+    """停止 Sidecar 守护进程"""
+    global _sidecar_process
+    if _sidecar_alive():
+        _sidecar_process.terminate()
+        try:
+            _sidecar_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _sidecar_process.kill()
+    _sidecar_process = None
+    _log("Sidecar 守护进程已停止")
+
+
+def feishu_cleanup():
+    """停止所有飞书相关进程（subscriber + sidecar）"""
+    feishu_stop()
+    sidecar_stop()
+    _log("飞书进程已全部清理")
+
+
+def ask_human_and_fill(selector, title, description, card_type="input",
+                       input_label="", options=None, timeout=300, user_id=None):
+    """发送飞书互动卡片，用户输入直接填入浏览器（数据不经过 Agent）。
+
+    敏感数据（验证码、密码等）只在 Sidecar 进程内存中存在，
+    通过 CDP 直接写入浏览器，Agent 脚本永远接触不到明文值。
+
+    Args:
+        selector:    要填入的 CSS 选择器 (如 "#verify-code")
+        title:       卡片标题
+        description: 卡片正文
+        card_type:   "input" | "select"
+        input_label: 输入框占位文字
+        options:     select 类型的选项列表
+        timeout:     等待超时秒数
+        user_id:     飞书用户 open_id
+
+    Returns:
+        dict: {"status": "filled"} | {"status": "timeout"} | {"status": "error", "message": "..."}
+    """
+    if not _sidecar_alive():
+        sidecar_start()
+
+    request_id = secrets.token_hex(6)
+
+    builders = {
+        "input": lambda: _build_input_card(title, description, input_label, request_id),
+        "select": lambda: _build_select_card(title, description, options or [], request_id),
+    }
+    builder = builders.get(card_type)
+    if not builder:
+        raise ValueError("ask_human_and_fill 仅支持 input/select，不支持: " + card_type)
+
+    sent_time_ms = int(time.time() * 1000)
+    message_id, chat_id = _send_feishu_card(builder(), user_id)
+    _log("Sidecar 卡片已发送 (%s, chat=%s), 等待用户输入..." % (message_id, chat_id))
+
+    registry_path = os.path.join(_SIDECAR_DIR, "registry", request_id + ".json")
+    with open(registry_path, "w") as f:
+        json.dump({"selector": selector, "chat_id": chat_id, "sent_time_ms": sent_time_ms}, f)
+    os.chmod(registry_path, 0o600)
+
+    status_path = os.path.join(_SIDECAR_DIR, "status", request_id + ".json")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = _safe_read_json(status_path)
+        if status is not None:
+            _safe_remove(status_path)
+            _safe_remove(registry_path)
+            _log("Sidecar 填入完成: status=%s" % status.get("status"))
+            return {"status": status.get("status")}
+        if not _sidecar_alive():
+            sidecar_start()
+        time.sleep(0.5)
+
+    _safe_remove(registry_path)
+    _log("Sidecar 等待超时 (%ds)" % timeout)
+    return {"status": "timeout"}
 
